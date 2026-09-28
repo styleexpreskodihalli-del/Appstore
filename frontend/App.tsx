@@ -9,19 +9,20 @@ import { TodayTab } from './components/TodayTab';
 import { ResultsTab } from './components/ResultsTab';
 import { BusinessTab } from './components/BusinessTab';
 import { GrowthEngineTab } from './components/GrowthEngineTab';
-import { CheckCircle2, ShieldAlert } from 'lucide-react';
+import { CheckCircle2, ShieldAlert, RefreshCw } from 'lucide-react';
 
 export const App: React.FC = () => {
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [platformSource, setPlatformSource] = useState<PlatformType>('web');
   const [profile, setProfile] = useState<STallBusinessProfile | null>(null);
   const [isSelectingLocation, setIsSelectingLocation] = useState(false);
+  const [isProvisioningStore, setIsProvisioningStore] = useState(false);
+  const [provisioningMessage, setProvisioningMessage] = useState('');
   const [activeTab, setActiveTab] = useState<'today' | 'results' | 'business' | 'growth'>('today');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isCallbackHandoffTab, setIsCallbackHandoffTab] = useState(false);
 
   useEffect(() => {
-    // 1. Check for incoming Google OAuth redirect callback in the URL
     const authResult = PlatformAuthService.extractOAuthResult(window.location.href);
 
     if (authResult.error) {
@@ -37,19 +38,10 @@ export const App: React.FC = () => {
       const expiresIn = authResult.expiresIn || 3600;
       const platform = authResult.platform || 'web';
 
-      console.debug('[STall GBP] Captured fresh OAuth access token from callback', {
-        tokenReceived: true,
-        tokenLength: freshToken.length,
-        expiresIn,
-        platform,
-      });
-
       try {
-        // Store the fresh token immediately
         GoogleBusinessService.clearSession();
         GoogleBusinessService.setAccessToken(freshToken, expiresIn);
 
-        // Notify other windows/tabs if running inside popup
         PlatformAuthService.broadcastAuthSuccess({
           platform,
           accessToken: freshToken,
@@ -63,8 +55,8 @@ export const App: React.FC = () => {
               {
                 type: 'STALL_GBP_AUTH_SUCCESS',
                 accessToken: freshToken,
-                expiresIn: expiresIn,
-                platform: platform,
+                expiresIn,
+                platform,
               },
               '*'
             );
@@ -73,18 +65,12 @@ export const App: React.FC = () => {
           }
           setIsCallbackHandoffTab(true);
           setTimeout(() => {
-            try {
-              window.close();
-            } catch {
-              // ignore
-            }
+            try { window.close(); } catch { /* ignore */ }
           }, 1200);
           return;
         }
 
-        // Clean the hash fragment from address bar, preserving ?key= query
         window.history.replaceState(null, '', window.location.pathname + window.location.search);
-
         setAccessToken(freshToken);
         setPlatformSource(platform);
         setLoginError(null);
@@ -98,7 +84,6 @@ export const App: React.FC = () => {
       }
     }
 
-    // 2. Load existing stored session only if no OAuth callback was present in URL
     const storedToken = GoogleBusinessService.getStoredAccessToken();
     const storedProfile = GoogleBusinessService.getStoredBusinessProfile();
     const detectedPlatform = PlatformAuthService.detectPlatform();
@@ -114,7 +99,6 @@ export const App: React.FC = () => {
             setPlatformSource(storedProfile.platformSource);
           }
         } else {
-          // Token exists, proceed to account & location selection
           setIsSelectingLocation(true);
         }
       } catch {
@@ -141,13 +125,81 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleLocationSelected = (accountName: string, location: GoogleLocation) => {
-    console.debug('[STall GBP] Location selected by user:', location.title || location.name);
-    const stallProfile = GoogleBusinessService.mapGoogleLocationToSTallProfile(accountName, location);
-    stallProfile.platformSource = platformSource;
-    GoogleBusinessService.setStoredBusinessProfile(stallProfile);
-    setProfile(stallProfile);
-    setIsSelectingLocation(false);
+  /**
+   * A Google location is not considered provisioned merely because it was selected.
+   * We re-fetch the exact location and then hydrate the STall profile with live
+   * reviews and the 30-day Performance API dataset. Optional data failures are
+   * retained as unavailable rather than fabricated as zeros.
+   */
+  const handleLocationSelected = async (accountName: string, location: GoogleLocation) => {
+    if (!accessToken) {
+      setLoginError('Google session is missing. Please reconnect your Google Business Profile.');
+      return;
+    }
+
+    setIsProvisioningStore(true);
+    setProvisioningMessage('Verifying the selected Google Business Profile location...');
+    setLoginError(null);
+
+    try {
+      const exactLocation = await GoogleBusinessService.fetchLocationDetail(location.name, accessToken);
+
+      if (!exactLocation.name || !exactLocation.name.includes('/locations/')) {
+        throw new Error('Google returned an invalid location resource. The store was not provisioned.');
+      }
+
+      const stallProfile = GoogleBusinessService.mapGoogleLocationToSTallProfile(accountName, exactLocation);
+      stallProfile.platformSource = platformSource;
+      stallProfile.connectedAt = new Date().toISOString();
+
+      setProvisioningMessage('Fetching live Google reviews and rating...');
+      try {
+        const reviewData = await GoogleBusinessService.fetchReviews(
+          accountName,
+          exactLocation.name,
+          accessToken
+        );
+        stallProfile.reviews = reviewData.reviews;
+        stallProfile.googleAverageRating = reviewData.averageRating ?? null;
+        stallProfile.googleTotalReviewCount = reviewData.totalReviewCount ?? null;
+      } catch (err) {
+        console.warn('[STall GBP] Review sync unavailable during provisioning:', err);
+        stallProfile.reviews = [];
+        stallProfile.googleAverageRating = null;
+        stallProfile.googleTotalReviewCount = null;
+      }
+
+      setProvisioningMessage('Fetching Google Performance data for the latest 30-day window...');
+      try {
+        stallProfile.performance = await GoogleBusinessService.fetchPerformanceMetrics(
+          exactLocation.name,
+          30,
+          accessToken
+        );
+      } catch (err) {
+        console.warn('[STall GBP] Performance sync unavailable during provisioning:', err);
+        stallProfile.performance = undefined;
+      }
+
+      // Persist only the selected, exact Google location as the STall business.
+      // No device location, Places search result, fallback business, or fabricated
+      // values are used for provisioning.
+      GoogleBusinessService.setStoredBusinessProfile(stallProfile);
+      localStorage.setItem('stall_selected_account', accountName);
+      localStorage.setItem('stall_selected_location', exactLocation.name);
+
+      setProvisioningMessage('Store connected successfully.');
+      setProfile(stallProfile);
+      setIsSelectingLocation(false);
+    } catch (err) {
+      console.error('[STall GBP] Store provisioning failed:', err);
+      const msg = err instanceof Error
+        ? err.message
+        : 'Google store provisioning failed. Please select the store again.';
+      setLoginError(msg);
+    } finally {
+      setIsProvisioningStore(false);
+    }
   };
 
   const handlePreviewSandboxLaunch = (sandboxProfile: STallBusinessProfile) => {
@@ -159,9 +211,13 @@ export const App: React.FC = () => {
 
   const handleLogout = () => {
     GoogleBusinessService.clearSession();
+    localStorage.removeItem('stall_selected_account');
+    localStorage.removeItem('stall_selected_location');
     setAccessToken(null);
     setProfile(null);
     setIsSelectingLocation(false);
+    setIsProvisioningStore(false);
+    setProvisioningMessage('');
     setActiveTab('today');
   };
 
@@ -214,7 +270,7 @@ export const App: React.FC = () => {
               externalError={loginError}
             />
 
-            {isSelectingLocation && accessToken && (
+            {isSelectingLocation && accessToken && !isProvisioningStore && (
               <LocationPickerModal
                 accessToken={accessToken}
                 onLocationSelected={handleLocationSelected}
@@ -227,6 +283,21 @@ export const App: React.FC = () => {
                   handleLogout();
                 }}
               />
+            )}
+
+            {isProvisioningStore && (
+              <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/85 backdrop-blur-sm p-6">
+                <div className="w-full max-w-md rounded-2xl border border-emerald-500/20 bg-slate-900 p-7 text-center shadow-2xl">
+                  <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-400">
+                    <RefreshCw className="h-6 w-6 animate-spin" />
+                  </div>
+                  <h2 className="text-lg font-bold text-white">Connecting your store</h2>
+                  <p className="mt-2 text-sm text-slate-400">{provisioningMessage || 'Provisioning live Google Business Profile data...'}</p>
+                  <p className="mt-4 text-[11px] text-slate-500">
+                    STall will use the exact Google location you selected. No demo or fallback store data is used.
+                  </p>
+                </div>
+              </div>
             )}
           </div>
         ) : (
